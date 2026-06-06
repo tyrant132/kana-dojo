@@ -10,6 +10,7 @@ import {
   getRedisCachedJson,
   setRedisCachedJson,
 } from '@/shared/infra/server/apiCache';
+import { captureServerEvent } from '@/shared/analytics/posthog-server';
 
 // Simple in-memory cache for translations (reduces API calls)
 const translationCache = new Map<
@@ -392,6 +393,7 @@ async function translateWithFallback({
  * with Google Cloud Translation as a secondary fallback.
  */
 export async function POST(request: NextRequest) {
+  const startTime = Date.now();
   try {
     const body = (await request.json()) as TranslationRequestBody;
     const {
@@ -404,6 +406,11 @@ export async function POST(request: NextRequest) {
 
     // Validate input
     if (!text || typeof text !== 'string') {
+      captureServerEvent('translate_rejected', {
+        reason: 'invalid_input',
+        status: 400,
+        char_count: 0,
+      });
       return NextResponse.json(
         {
           code: ERROR_CODES.INVALID_INPUT,
@@ -416,6 +423,13 @@ export async function POST(request: NextRequest) {
     }
 
     if (text.trim().length === 0) {
+      captureServerEvent('translate_rejected', {
+        reason: 'invalid_input',
+        status: 400,
+        source: sourceLanguage,
+        target: targetLanguage,
+        char_count: 0,
+      });
       return NextResponse.json(
         {
           code: ERROR_CODES.INVALID_INPUT,
@@ -428,6 +442,13 @@ export async function POST(request: NextRequest) {
     }
 
     if (text.length > 5000) {
+      captureServerEvent('translate_rejected', {
+        reason: 'invalid_input',
+        status: 400,
+        source: sourceLanguage,
+        target: targetLanguage,
+        char_count: text.length,
+      });
       return NextResponse.json(
         {
           code: ERROR_CODES.INVALID_INPUT,
@@ -445,6 +466,13 @@ export async function POST(request: NextRequest) {
       !validLanguages.includes(sourceLanguage) ||
       !validLanguages.includes(targetLanguage)
     ) {
+      captureServerEvent('translate_rejected', {
+        reason: 'invalid_input',
+        status: 400,
+        source: sourceLanguage,
+        target: targetLanguage,
+        char_count: text.length,
+      });
       return NextResponse.json(
         {
           code: ERROR_CODES.INVALID_INPUT,
@@ -457,6 +485,13 @@ export async function POST(request: NextRequest) {
     }
 
     if (sourceLanguage === targetLanguage) {
+      captureServerEvent('translate_rejected', {
+        reason: 'invalid_input',
+        status: 400,
+        source: sourceLanguage,
+        target: targetLanguage,
+        char_count: text.length,
+      });
       return NextResponse.json(
         {
           code: ERROR_CODES.INVALID_INPUT,
@@ -481,6 +516,13 @@ export async function POST(request: NextRequest) {
     }>('translate', cacheKey);
     if (redisCached) {
       cacheHits++;
+      captureServerEvent('translate_cache_hit', {
+        cache_layer: 'redis',
+        source: sourceLanguage,
+        target: targetLanguage,
+        char_count: normalizedText.length,
+        request_context: requestContext,
+      });
       const response = NextResponse.json({
         translatedText: redisCached.translatedText,
         romanization: redisCached.romanization,
@@ -493,6 +535,13 @@ export async function POST(request: NextRequest) {
     const cached = translationCache.get(cacheKey);
     if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
       cacheHits++;
+      captureServerEvent('translate_cache_hit', {
+        cache_layer: 'memory',
+        source: sourceLanguage,
+        target: targetLanguage,
+        char_count: normalizedText.length,
+        request_context: requestContext,
+      });
       const response = NextResponse.json({
         translatedText: cached.translatedText,
         romanization: cached.romanization,
@@ -504,6 +553,14 @@ export async function POST(request: NextRequest) {
     }
 
     if (isLikelyBot(request)) {
+      captureServerEvent('translate_rejected', {
+        reason: 'bot',
+        status: 429,
+        source: sourceLanguage,
+        target: targetLanguage,
+        char_count: normalizedText.length,
+        request_context: requestContext,
+      });
       return NextResponse.json(
         {
           code: ERROR_CODES.RATE_LIMIT,
@@ -519,6 +576,14 @@ export async function POST(request: NextRequest) {
       requestContext === 'url-prefill' &&
       normalizedText.length > URL_AUTOTRANSLATE_CHAR_LIMIT
     ) {
+      captureServerEvent('translate_rejected', {
+        reason: 'verification_required',
+        status: 403,
+        source: sourceLanguage,
+        target: targetLanguage,
+        char_count: normalizedText.length,
+        request_context: requestContext,
+      });
       return NextResponse.json(
         {
           code: ERROR_CODES.VERIFICATION_REQUIRED,
@@ -547,6 +612,15 @@ export async function POST(request: NextRequest) {
         message = `Too many requests. Please wait ${rateLimitResult.retryAfter} seconds.`;
       }
 
+      captureServerEvent('translate_rejected', {
+        reason: 'rate_limit',
+        status: 429,
+        source: sourceLanguage,
+        target: targetLanguage,
+        char_count: normalizedText.length,
+        request_context: requestContext,
+        rate_limit_reason: rateLimitResult.reason,
+      });
       return NextResponse.json(
         {
           code: ERROR_CODES.RATE_LIMIT,
@@ -573,6 +647,15 @@ export async function POST(request: NextRequest) {
           ? 'Service is experiencing high demand. Please try again later.'
           : 'Daily translation limit reached. Please try again later.';
 
+      captureServerEvent('translate_rejected', {
+        reason: 'usage_limit',
+        status: 429,
+        source: sourceLanguage,
+        target: targetLanguage,
+        char_count: normalizedText.length,
+        request_context: requestContext,
+        rate_limit_reason: usageResult.reason,
+      });
       return NextResponse.json(
         {
           code: ERROR_CODES.RATE_LIMIT,
@@ -590,6 +673,14 @@ export async function POST(request: NextRequest) {
       process.env.TURNSTILE_SECRET_KEY &&
       process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY
     ) {
+      captureServerEvent('translate_rejected', {
+        reason: 'verification_required',
+        status: 403,
+        source: sourceLanguage,
+        target: targetLanguage,
+        char_count: normalizedText.length,
+        request_context: requestContext,
+      });
       return NextResponse.json(
         {
           code: ERROR_CODES.VERIFICATION_REQUIRED,
@@ -615,6 +706,21 @@ export async function POST(request: NextRequest) {
       const providerError =
         error instanceof TranslationProviderError ? error : null;
       const status = providerError?.status || 500;
+      const errorCategory = providerError?.authError
+        ? 'auth'
+        : providerError?.status === 429
+          ? 'rate_limit'
+          : 'api';
+
+      captureServerEvent('translate_provider_error', {
+        error_category: errorCategory,
+        status,
+        latency_ms: Date.now() - startTime,
+        source: sourceLanguage,
+        target: targetLanguage,
+        char_count: normalizedText.length,
+        request_context: requestContext,
+      });
 
       if (providerError?.status === 429) {
         return NextResponse.json(
@@ -695,6 +801,15 @@ export async function POST(request: NextRequest) {
 
     cleanupCache();
 
+    captureServerEvent('translate_success', {
+      provider: translation.provider,
+      latency_ms: Date.now() - startTime,
+      source: sourceLanguage,
+      target: targetLanguage,
+      char_count: normalizedText.length,
+      request_context: requestContext,
+    });
+
     const rateLimitHeaders = createRateLimitHeaders(rateLimitResult);
     const response = NextResponse.json({
       translatedText: translation.translatedText,
@@ -715,8 +830,17 @@ export async function POST(request: NextRequest) {
   } catch (error) {
     console.error('Translation API error:', error);
 
+    const isNetworkError =
+      error instanceof TypeError && error.message.includes('fetch');
+
+    captureServerEvent('translate_unhandled_error', {
+      error_category: isNetworkError ? 'network' : 'unknown',
+      status: isNetworkError ? 503 : 500,
+      latency_ms: Date.now() - startTime,
+    });
+
     // Check if it's a network error
-    if (error instanceof TypeError && error.message.includes('fetch')) {
+    if (isNetworkError) {
       return NextResponse.json(
         {
           code: ERROR_CODES.NETWORK_ERROR,
